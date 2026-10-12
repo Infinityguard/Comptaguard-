@@ -831,12 +831,12 @@ def page_admin() -> None:
 # --------------------------------------------------------------------------
 # Navigation par rôle
 # --------------------------------------------------------------------------
-ALL_BUT_STORE = {"Administrateur", "Comptable", "Responsable", "Gestionnaire de paie", "Auditeur"}
 PAGES = [
     # (section, titre, icône, chemin, fonction, rôles autorisés)
     ("Contrôles", "Contrôle des écritures", ":material/fact_check:", "ecritures", page_ecritures,
      {"Administrateur", "Comptable", "Auditeur"}),
-    ("Contrôles", "Rapprochement", ":material/compare_arrows:", "rapprochement", page_rapprochement, ALL_BUT_STORE),
+    ("Contrôles", "Rapprochement", ":material/compare_arrows:", "rapprochement", page_rapprochement,
+     {"Administrateur", "Comptable", "Responsable", "Auditeur"}),
     ("Contrôles", "Factures et TVA", ":material/receipt_long:", "factures", page_factures,
      {"Administrateur", "Comptable"}),
     ("Stocks", "Stocks physiques", ":material/inventory_2:", "stocks", page_stocks,

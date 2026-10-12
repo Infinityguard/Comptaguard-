@@ -272,6 +272,11 @@ def normalize_trial_balance(raw: pd.DataFrame) -> pd.DataFrame:
     df.attrs["credit_source"] = credit_col
     return df
 
+def _exact_sum(values) -> Decimal:
+    """Somme exacte d'une série de montants (valeurs manquantes comptées pour zéro)."""
+    return sum((to_decimal(v) for v in values), Decimal(0))
+
+
 def analyze_trial_balance(raw: pd.DataFrame, tolerance: float = 0.01) -> tuple[pd.DataFrame, dict]:
     """Contrôles arithmétiques de base sur une balance, sans présumer de sa conformité légale."""
     df = normalize_trial_balance(raw)
@@ -289,12 +294,16 @@ def analyze_trial_balance(raw: pd.DataFrame, tolerance: float = 0.01) -> tuple[p
     for account in duplicates["compte"].dropna().unique():
         issues.append({"compte": account, "probleme": "Compte présent plusieurs fois",
                        "gravite": "Moyenne", "detail": "Vérifier si les lignes doivent être regroupées."})
-    total_debit = float(df[debit_col].sum())
-    total_credit = float(df[credit_col].sum())
-    gap = total_debit - total_credit
-    if abs(gap) > tolerance:
+    # Totaux exacts (Decimal) : évite qu'un écart égal à la tolérance soit signalé à cause
+    # d'un artefact binaire des flottants (ex. 100,01 − 100,00 = 0,010000000000000009).
+    total_debit_d = _exact_sum(df[debit_col])
+    total_credit_d = _exact_sum(df[credit_col])
+    gap_d = total_debit_d - total_credit_d
+    if abs(gap_d) > to_decimal(tolerance):
+        gap_text = f"{gap_d:,.2f}" if gap_d == gap_d.quantize(Decimal("0.01")) else f"{gap_d:,f}"
         issues.append({"compte": "(total)", "probleme": "Balance déséquilibrée", "gravite": "Haute",
-                       "detail": f"Écart débit − crédit : {gap:,.2f}".replace(",", " ")})
+                       "detail": f"Écart débit − crédit : {gap_text}".replace(",", " ")})
+    total_debit, total_credit, gap = float(total_debit_d), float(total_credit_d), float(gap_d)
     summary = {"nombre_comptes": int(len(df)), "total_debit": total_debit,
                "total_credit": total_credit, "ecart": gap, "debit_colonne": debit_col,
                "credit_colonne": credit_col}
@@ -325,25 +334,30 @@ def reconcile_ledger_balance(ledger_raw: pd.DataFrame, balance_raw: pd.DataFrame
             if any(not valid for _, valid in parsed):
                 raise ValueError(f"Le document {label} contient des montants non numériques dans la colonne {col}.")
             out[col] = [value for value, _ in parsed]
-        return out.groupby("compte", as_index=False)[["debit", "credit"]].sum()
+        return out.groupby("compte", as_index=False)[["debit", "credit"]].agg(_exact_sum)
 
     led = clean(ledger, "grand livre").rename(columns={"debit": "debit_grand_livre", "credit": "credit_grand_livre"})
     bal = clean(balance, "balance").rename(columns={"debit": "debit_balance", "credit": "credit_balance"})
     result = led.merge(bal, on="compte", how="outer", indicator=True)
+    tol = to_decimal(tolerance)
     for col in ("debit_grand_livre", "credit_grand_livre", "debit_balance", "credit_balance"):
-        result[col] = result[col].fillna(0)
+        result[col] = result[col].map(lambda v: Decimal(0) if pd.isna(v) else v)
     result["ecart_debit"] = result["debit_grand_livre"] - result["debit_balance"]
     result["ecart_credit"] = result["credit_grand_livre"] - result["credit_balance"]
     result["ecart_net"] = (result["debit_grand_livre"] - result["credit_grand_livre"]) - (result["debit_balance"] - result["credit_balance"])
-    result["statut"] = result.apply(lambda r: "À vérifier" if r["_merge"] != "both" or abs(r["ecart_debit"]) > tolerance or abs(r["ecart_credit"]) > tolerance else "Concordant", axis=1)
+    result["statut"] = result.apply(lambda r: "À vérifier" if r["_merge"] != "both" or abs(r["ecart_debit"]) > tol or abs(r["ecart_credit"]) > tol else "Concordant", axis=1)
     result["motif"] = result.apply(lambda r: "Compte absent d'un des documents" if r["_merge"] != "both" else ("Écart de mouvements" if r["statut"] == "À vérifier" else "Mouvements concordants"), axis=1)
     result = result.drop(columns=["_merge"]).sort_values(["statut", "compte"], ascending=[True, True]).reset_index(drop=True)
+    total_ecart_debit, total_ecart_credit = _exact_sum(result["ecart_debit"]), _exact_sum(result["ecart_credit"])
+    for col in ("debit_grand_livre", "credit_grand_livre", "debit_balance", "credit_balance",
+                "ecart_debit", "ecart_credit", "ecart_net"):
+        result[col] = result[col].astype(float)
     summary = {
         "comptes_comparés": int(len(result)),
         "comptes_concordants": int((result["statut"] == "Concordant").sum()),
         "comptes_a_verifier": int((result["statut"] == "À vérifier").sum()),
-        "ecart_total_debit": float(result["ecart_debit"].sum()),
-        "ecart_total_credit": float(result["ecart_credit"].sum()),
+        "ecart_total_debit": float(total_ecart_debit),
+        "ecart_total_credit": float(total_ecart_credit),
         "tolerance": tolerance,
     }
     return result, summary

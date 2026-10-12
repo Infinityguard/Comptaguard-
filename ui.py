@@ -15,6 +15,12 @@ APP_VERSION = "12"
 
 NBSP = "\u00a0"
 
+# Palette (alignée sur .streamlit/config.toml)
+PRIMARY = "#2E7D32"
+DARK = "#1B5E20"
+MUTED = "#3F5B41"
+BORDER = "#AED581"
+
 # --------------------------------------------------------------------------
 # Style global
 # --------------------------------------------------------------------------
@@ -24,18 +30,18 @@ _CSS = """
 .block-container {padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1200px;}
 h1 {font-size: 1.75rem !important; font-weight: 650 !important; letter-spacing: -0.01em; padding-bottom: .15rem;}
 h2, h3 {font-weight: 600 !important; letter-spacing: -0.005em;}
-.cg-sub {color: #5B6573; margin: 0 0 1.4rem 0; font-size: 1rem;}
-[data-testid="stSidebar"] {border-right: 1px solid #E3E8EF;}
+.cg-sub {color: #3F5B41; margin: 0 0 1.4rem 0; font-size: 1rem;}
+[data-testid="stSidebar"] {border-right: 1px solid #AED581;}
 [data-testid="stMetricValue"] {font-size: 1.55rem; font-weight: 600;}
-[data-testid="stMetricLabel"] p {color: #5B6573; font-size: .85rem;}
+[data-testid="stMetricLabel"] p {color: #3F5B41; font-size: .85rem;}
 .stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button {
     border-radius: 6px; font-weight: 500;
 }
 .cg-brand {display: flex; align-items: center; gap: .8rem; margin: 2rem 0 1.2rem 0;}
-.cg-mark {width: 2.6rem; height: 2.6rem; border-radius: 8px; background: #1F4E79; color: #fff;
+.cg-mark {width: 2.6rem; height: 2.6rem; border-radius: 8px; background: #2E7D32; color: #fff;
     display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.3rem;}
-.cg-name {font-size: 1.3rem; font-weight: 650; line-height: 1.15; color: #1B2430;}
-.cg-tag {font-size: .85rem; color: #5B6573;}
+.cg-name {font-size: 1.3rem; font-weight: 650; line-height: 1.15; color: #1B5E20;}
+.cg-tag {font-size: .85rem; color: #3F5B41;}
 </style>
 """
 
@@ -242,7 +248,7 @@ def excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
             ws = writer.sheets[sheet_name]
             for cell in ws[1]:
                 cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill("solid", fgColor="1F4E79")
+                cell.fill = PatternFill("solid", fgColor="2E7D32")
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
             ws.freeze_panes = "A2"
             for idx, col in enumerate(frame.columns, start=1):
