@@ -540,6 +540,7 @@ def analyze(df: pd.DataFrame, window_days: int = 7, min_round_amount: int = 1000
 
         # 7. Équilibre par pièce, date et (si disponible) journal.
         # La date évite qu'un numéro de pièce réutilisé plus tard masque un écart.
+        # (Une ligne à date invalide est rattachée à sa pièce, voir plus bas.)
         # Sans journal, des pièces distinctes le même jour et portant le même numéro
         # restent impossibles à distinguer : l'interface doit signaler cette limite.
         wp = df[df["piece"].notna()].copy()
@@ -549,6 +550,23 @@ def analyze(df: pd.DataFrame, window_days: int = 7, min_round_amount: int = 1000
         if has_journal:
             wp["journal"] = wp["journal"].fillna(NO_JOURNAL).astype(str)
             keys_bal = ["_date_key", "journal", "piece"]
+        # Une ligne sans date valide ne doit pas scinder sa pièce en deux groupes :
+        # elle rejoint la date de la pièce (même journal et même numéro) lorsque
+        # celle-ci n'a qu'une seule date valide. S'il y en a plusieurs (numéro
+        # réutilisé à des dates différentes) ou aucune, elle reste isolée, car on ne
+        # peut pas savoir à quel groupe elle appartient. Son anomalie de date reste
+        # signalée par le contrôle n° 4.
+        base_keys = [k for k in keys_bal if k != "_date_key"]
+        valid_dates = wp.loc[wp["date"].notna()].groupby(base_keys)["_date_key"].agg(
+            lambda s: sorted(set(s)))
+        invalid = wp["date"].isna()
+        if invalid.any() and not valid_dates.empty:
+            def _attach(row):
+                key = tuple(row[k] for k in base_keys)
+                key = key[0] if len(key) == 1 else key
+                dates = valid_dates.get(key)
+                return dates[0] if dates is not None and len(dates) == 1 else row["_date_key"]
+            wp.loc[invalid, "_date_key"] = wp.loc[invalid].apply(_attach, axis=1)
         if not wp.empty:
             # Sommes exactes en Decimal : un arrondi flottant à 2 décimales masquerait
             # les écarts inférieurs à 0,005 alors que la tolérance affichée est plus fine.
