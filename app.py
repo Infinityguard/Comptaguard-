@@ -25,9 +25,16 @@ from security_db import (ROLES, authenticate, backup_database_bytes, create_camp
                          list_campaigns, list_users, log_event, login_lock_remaining, save_campaign_lines,
                          set_user_active, submit_campaign_for_review, update_campaign_status)
 from stocks import analyze_physical_stock, stock_template_bytes
+from stock_management import init_stock_db, create_item, list_items, stock_summary, register_movement, list_movements, transfer_stock
 from tolerance import piece_balance_diagnostics
+from emission_factures import create_ticket, init_invoicing_db, list_tickets
+import transport_factures as tf
+import referentiels_aic as ref
 
 init_db()
+init_stock_db()
+init_invoicing_db()
+tf.init_transport_db()
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ACCEPTED = ["xlsx", "xlsm", "csv"]
@@ -354,6 +361,136 @@ def page_rapprochement() -> None:
                            file_name=f"rapprochement_{stamp()}.csv", mime="text/csv")
         limits("Le rapprochement porte sur les mouvements débit/crédit par compte.",
                "Il ne rapproche pas les soldes d'ouverture et de clôture et ne remplace pas une revue comptable.")
+
+
+# --------------------------------------------------------------------------
+# Page : gestion opérationnelle des stocks (consommables et fournitures, CMUP)
+# --------------------------------------------------------------------------
+def page_gestion_stocks() -> None:
+    role = current_user["role"]
+    can_manage = role in {"Administrateur", "Comptable", "Responsable", "Magasinier"}
+    page_header("Gestion des stocks", "Gérez les consommables et fournitures : articles, entrées, sorties, stock disponible, valorisation CMUP et historique traçable.")
+    rows = stock_summary()
+    if rows:
+        total_value = sum((Decimal(r["valeur_stock"]) for r in rows), Decimal("0"))
+        low = sum(1 for r in rows if r["alerte"] == "Stock bas")
+        kpis([("Articles actifs", len(rows)), ("Valeur du stock (FCFA)", f"{total_value:,.2f}"), ("Alertes de stock", low)])
+    tabs = st.tabs(["Vue du stock", "Articles", "Mouvement de stock", "Transfert", "Historique"])
+    with tabs[0]:
+        if rows:
+            df = pd.DataFrame(rows)
+            cols = ["code", "designation", "category", "unit", "warehouse", "location_zone", "location_shelf", "location_bin", "stock_disponible", "cmup", "valeur_stock", "min_qty", "alerte"]
+            df = df[cols].rename(columns={"code":"Code", "designation":"Désignation", "category":"Catégorie", "unit":"Unité", "warehouse":"Magasin", "location_zone":"Zone", "location_shelf":"Étagère", "location_bin":"Casier", "stock_disponible":"Stock disponible", "cmup":"CMUP (FCFA)", "valeur_stock":"Valeur (FCFA)", "min_qty":"Seuil minimum", "alerte":"État"})
+            show_table(df)
+            st.download_button("Exporter l'état du stock (Excel)", data=excel_bytes({"Etat du stock": df}), file_name=f"etat_stock_{stamp()}.xlsx", mime=XLSX)
+        else:
+            st.info("Aucun article actif. Commencez par créer les articles dans l’onglet Articles.")
+        st.caption("Le CMUP est recalculé à chaque entrée. Les sorties sont valorisées au CMUP en vigueur. Les mouvements validés sont conservés dans l’historique.")
+    with tabs[1]:
+        st.subheader("Créer un article consommable ou une fourniture")
+        if not can_manage:
+            st.info("Votre profil est en consultation seule.")
+        else:
+            with st.form("stock_create_item", clear_on_submit=True):
+                c1,c2,c3 = st.columns(3)
+                code = c1.text_input("Code article *", placeholder="EX. FOUR-001")
+                designation = c2.text_input("Désignation *", placeholder="Huile moteur, papier A4…")
+                category = c3.selectbox("Catégorie", ["Fournitures", "Pièces de rechange", "Carburants et lubrifiants", "Produits d’entretien", "Consommables de production", "Autres"])
+                c4,c5,c6 = st.columns(3)
+                unit = c4.selectbox("Unité de mesure", ["unité", "pièce", "litre", "kg", "sac", "boîte", "carton", "ramette", "mètre", "paquet"])
+                warehouse = c5.text_input("Magasin / entrepôt *", value="Magasin principal")
+                minimum = c6.number_input("Seuil minimum", min_value=0.0, value=0.0, step=1.0)
+                loc1,loc2,loc3 = st.columns(3)
+                location_zone = loc1.text_input("Zone / rayon", placeholder="Ex. Zone A")
+                location_shelf = loc2.text_input("Étagère", placeholder="Ex. Étagère 03")
+                location_bin = loc3.text_input("Casier / emplacement", placeholder="Ex. Casier B")
+                save_item = st.form_submit_button("Créer l’article", type="primary")
+            if save_item:
+                try:
+                    create_item({"code":code,"designation":designation,"category":category,"unit":unit,"warehouse":warehouse,"location_zone":location_zone,"location_shelf":location_shelf,"location_bin":location_bin,"min_qty":minimum}, current_user["username"])
+                    st.success("Article créé. Enregistrez ensuite une entrée initiale pour alimenter le stock.")
+                    st.rerun()
+                except Exception as exc: st.error(f"Création impossible : {exc}")
+    with tabs[2]:
+        st.subheader("Enregistrer un mouvement")
+        active_items = list_items(active_only=True)
+        if not active_items:
+            st.warning("Créez d’abord au moins un article.")
+        elif not can_manage:
+            st.info("Votre profil est en consultation seule.")
+        else:
+            with st.form("stock_movement_form"):
+                item = st.selectbox("Article", active_items, format_func=lambda x: f"{x['code']} — {x['designation']} ({x['warehouse']} / {x.get('location_zone','')} / {x.get('location_shelf','')} / {x.get('location_bin','')})")
+                c1,c2,c3 = st.columns(3)
+                mtype = c1.selectbox("Type de mouvement", ["Entrée", "Sortie", "Ajustement +", "Ajustement -"])
+                mdate = c2.date_input("Date du mouvement", value=datetime.now().date())
+                qty = c3.number_input("Quantité", min_value=0.001, value=1.0, step=1.0, format="%.3f")
+                loc1,loc2,loc3,loc4 = st.columns(4)
+                move_warehouse = loc1.text_input("Magasin du mouvement", value=item['warehouse'])
+                move_zone = loc2.text_input("Zone / rayon", value=item.get('location_zone',''))
+                move_shelf = loc3.text_input("Étagère", value=item.get('location_shelf',''))
+                move_bin = loc4.text_input("Casier", value=item.get('location_bin',''))
+                current = next((x for x in rows if int(x["id"]) == int(item["id"]) and x['warehouse']==move_warehouse and x.get('location_zone','')==move_zone and x.get('location_shelf','')==move_shelf and x.get('location_bin','')==move_bin), None)
+                if current: st.caption(f"Stock actuel : {current['stock_disponible']} {item['unit']} · CMUP actuel : {current['cmup']} FCFA")
+                cost = st.number_input("Coût unitaire d’entrée (FCFA)", min_value=0.0, value=0.0, step=100.0, disabled=mtype in ("Sortie", "Ajustement -"), help="Pour une entrée, saisir le coût d'acquisition unitaire. Pour une sortie, le CMUP est appliqué automatiquement.")
+                c4,c5 = st.columns(2)
+                reference = c4.text_input("Référence justificative", placeholder="N° bon de réception / bon de sortie")
+                beneficiary = c5.text_input("Service bénéficiaire / fournisseur")
+                reason = st.text_area("Motif / observations *", placeholder="Expliquez la nature du mouvement et sa justification.")
+                submit_move = st.form_submit_button("Enregistrer le mouvement", type="primary")
+            if submit_move:
+                if not reason.strip(): st.error("Le motif est obligatoire pour assurer la traçabilité.")
+                elif mtype == "Entrée" and cost <= 0: st.error("Le coût unitaire d’une entrée doit être supérieur à zéro.")
+                else:
+                    try:
+                        register_movement(item["id"], mtype, qty, cost, current_user["username"], str(mdate), reference, beneficiary, reason, move_warehouse, move_zone, move_shelf, move_bin)
+                        st.success("Mouvement enregistré. Le stock et le CMUP ont été recalculés.")
+                        st.rerun()
+                    except Exception as exc: st.error(f"Mouvement refusé : {exc}")
+    with tabs[3]:
+        st.subheader("Transférer un article entre deux emplacements")
+        active_items = list_items(active_only=True)
+        if not can_manage:
+            st.info("Votre profil est en consultation seule.")
+        elif not active_items:
+            st.info("Créez d’abord un article et enregistrez une entrée de stock.")
+        else:
+            with st.form("stock_transfer_form", clear_on_submit=True):
+                item_t = st.selectbox("Article à transférer", active_items, format_func=lambda x: f"{x['code']} — {x['designation']}")
+                st.markdown("**Emplacement de départ**")
+                a,b,c,d = st.columns(4)
+                src_wh = a.text_input("Magasin source *", value=item_t['warehouse'])
+                src_zone = b.text_input("Zone source", value=item_t.get('location_zone',''))
+                src_shelf = c.text_input("Étagère source", value=item_t.get('location_shelf',''))
+                src_bin = d.text_input("Casier source", value=item_t.get('location_bin',''))
+                st.markdown("**Emplacement d’arrivée**")
+                e,f,g,h = st.columns(4)
+                dst_wh = e.text_input("Magasin destination *", value="Magasin secondaire")
+                dst_zone = f.text_input("Zone destination")
+                dst_shelf = g.text_input("Étagère destination")
+                dst_bin = h.text_input("Casier destination")
+                q_t = st.number_input("Quantité à transférer", min_value=0.001, value=1.0, step=1.0, format="%.3f")
+                date_t = st.date_input("Date du transfert", value=datetime.now().date())
+                ref_t = st.text_input("Référence du bon de transfert")
+                reason_t = st.text_area("Motif du transfert *", placeholder="Ex. Réorganisation du magasin")
+                submit_transfer = st.form_submit_button("Valider le transfert", type="primary")
+            if submit_transfer:
+                try:
+                    transfer_stock(item_t['id'], q_t, current_user['username'],
+                        {'warehouse':src_wh,'location_zone':src_zone,'location_shelf':src_shelf,'location_bin':src_bin},
+                        {'warehouse':dst_wh,'location_zone':dst_zone,'location_shelf':dst_shelf,'location_bin':dst_bin},
+                        str(date_t), ref_t, reason_t)
+                    st.success("Transfert enregistré. Les deux emplacements sont tracés dans l’historique.")
+                    st.rerun()
+                except Exception as exc: st.error(f"Transfert refusé : {exc}")
+    with tabs[4]:
+        history = list_movements(limit=1000)
+        if history:
+            hdf = pd.DataFrame(history).rename(columns={"id":"N°", "movement_date":"Date", "warehouse":"Magasin", "location_zone":"Zone", "location_shelf":"Étagère", "location_bin":"Casier", "code":"Code article", "designation":"Désignation", "movement_type":"Mouvement", "quantity":"Quantité", "unit":"Unité", "unit_cost":"Coût unitaire (FCFA)", "total_cost":"Valeur (FCFA)", "cmup_after":"CMUP après (FCFA)", "qty_after":"Stock après", "reference":"Référence", "beneficiary":"Bénéficiaire / fournisseur", "reason":"Motif", "created_by":"Enregistré par", "created_at":"Horodatage"})
+            show_table(hdf)
+            st.download_button("Exporter l’historique (Excel)", data=excel_bytes({"Mouvements": hdf}), file_name=f"historique_mouvements_stock_{stamp()}.xlsx", mime=XLSX)
+        else: st.info("Aucun mouvement enregistré.")
+        limits("Les mouvements enregistrés ne sont ni modifiables ni supprimables. En cas d’erreur, utilisez une contre-opération justifiée.", "Cette première version calcule la valorisation interne au CMUP ; elle ne génère pas automatiquement d’écritures comptables.")
 
 
 # --------------------------------------------------------------------------
@@ -829,6 +966,344 @@ def page_admin() -> None:
 
 
 # --------------------------------------------------------------------------
+# Page : tickets de pesée
+# --------------------------------------------------------------------------
+def page_tickets_pesee() -> None:
+    can_ticket = current_user["role"] in {"Administrateur", "Comptable", "Responsable", "Magasinier"}
+    page_header("Tickets de pesée",
+                "Saisissez les tickets du pont-bascule. Ils servent ensuite de base à la facture de transport "
+                "(règlement des transporteurs). Un ticket enregistré ne peut plus être modifié.")
+    tickets = list_tickets()
+    kpis([("Tickets enregistrés", len(tickets)),
+          ("Tickets à régler (transport)", len(tf.tickets_to_settle()))])
+    if not can_ticket:
+        st.info("Votre profil est en consultation seule.")
+    else:
+        with st.form("ticket_form", clear_on_submit=True):
+            st.markdown("**Identification**")
+            a, b, c = st.columns(3)
+            ticket_no = a.text_input("N° du ticket *")
+            site = b.text_input("Site", value="PONT USINE SEROU")
+            campaign = c.text_input("Campagne", value="2025-2026")
+            st.markdown("**Pesées**")
+            d1, d2, d3, d4 = st.columns(4)
+            date_p1 = d1.date_input("Date P1", value=datetime.now().date(), key="t_dp1")
+            time_p1 = d2.text_input("Heure P1", placeholder="23:48:47")
+            date_p2 = d3.date_input("Date P2", value=datetime.now().date(), key="t_dp2")
+            time_p2 = d4.text_input("Heure P2", placeholder="05:57:03")
+            w1, w2, w3, w4 = st.columns(4)
+            p1 = w1.number_input("Poids P1 (kg) *", min_value=0, step=10)
+            p2 = w2.number_input("Poids P2 (kg) *", min_value=0, step=10)
+            printed = w3.number_input("Poids net imprimé (kg)", min_value=0, step=10,
+                                      help="Facultatif : s'il est renseigné, il doit être égal à |P1 − P2|.")
+            humidity = w4.text_input("Taux H. (%)", placeholder="6,80")
+            st.markdown("**Mouvement et produit**")
+            m1, m2, m3, m4 = st.columns(4)
+            vehicle = m1.text_input("Véhicule", placeholder="BZ9904RB")
+            trailer = m2.text_input("Remorque")
+            movement = m3.selectbox("Mouvement", ["CHARGEMENT", "DÉCHARGEMENT", "TRANSFERT", "AUTRE"])
+            product = m4.text_input("Produit", value="COTON GRAINE")
+            n1, n2, n3, n4 = st.columns(4)
+            variety = n1.text_input("Variété", placeholder="ANG 956")
+            choice = n2.text_input("Choix", placeholder="1ER CHOIX")
+            cvpc = n3.text_input("CVPC", placeholder="USINE")
+            market = n4.text_input("Marché", placeholder="SILO 1")
+            other_market = st.text_input("Autre marché")
+            st.markdown("**Parties et trajet**")
+            q1, q2, q3 = st.columns(3)
+            client = q1.text_input("Client", value="SOCOPA")
+            supplier = q2.text_input("Fournisseur", value="SOCOPA")
+            transporter = q3.text_input("Transporteur")
+            r1, r2, r3, r4 = st.columns(4)
+            origin = r1.text_input("Provenance", placeholder="USINE-SILOS")
+            destination = r2.text_input("Destination", placeholder="ASPIRATION")
+            quart = r3.text_input("Quart", placeholder="QUART B")
+            commune = r4.text_input("Commune")
+            s1, s2 = st.columns(2)
+            evacuation = s1.text_input("BD. évacuation", placeholder="R545")
+            enlevement = s2.text_input("N° d'enlèvement")
+            st.markdown("**Intervenants**")
+            u1, u2, u3 = st.columns(3)
+            weigher = u1.text_input("Peseur")
+            driver = u2.text_input("Chauffeur")
+            permit = u3.text_input("N° permis chauffeur")
+            observations = st.text_area("Observations", height=68)
+            submit = st.form_submit_button("Enregistrer le ticket", type="primary")
+        if submit:
+            try:
+                create_ticket({"ticket_no": ticket_no, "site": site, "campaign": campaign,
+                               "date_p1": date_p1.isoformat(), "time_p1": time_p1,
+                               "date_p2": date_p2.isoformat(), "time_p2": time_p2, "vehicle": vehicle,
+                               "trailer": trailer, "movement": movement, "product": product,
+                               "humidity_rate": humidity, "client": client, "supplier": supplier,
+                               "transporter": transporter, "origin": origin, "destination": destination,
+                               "quart": quart, "commune": commune, "evacuation_bd": evacuation,
+                               "enlevement_no": enlevement, "choice": choice, "variety": variety, "cvpc": cvpc,
+                               "market": market, "other_market": other_market, "weight_p1": p1, "weight_p2": p2,
+                               "observations": observations, "weigher": weigher, "driver": driver,
+                               "driver_permit": permit},
+                              current_user["username"], printed_net=printed or None)
+                st.success("Ticket enregistré. Le poids net a été recalculé et contrôlé.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Enregistrement impossible : {exc}")
+    if tickets:
+        df = pd.DataFrame(tickets).drop(columns=["created_by", "created_at", "invoice_id"])
+        df["facture de transport"] = df.pop("transport_invoice_id").map(lambda v: "Oui" if v == v and v else "Non")
+        show_table(df, height=360)
+        st.download_button("Exporter les tickets (Excel)", data=excel_bytes({"Tickets": df}),
+                           file_name=f"tickets_pesee_{stamp()}.xlsx", mime=XLSX)
+    else:
+        st.info("Aucun ticket enregistré.")
+
+
+# --------------------------------------------------------------------------
+# Page : règlement des transporteurs (factures de transport)
+# --------------------------------------------------------------------------
+def page_reglement_transporteurs() -> None:
+    role = current_user.get("role", "")
+    # Les factures de transport relèvent de l'administrateur principal.
+    # Comptable et Auditeur disposent uniquement d'un accès en lecture.
+    # Le Magasinier et les autres profils ne doivent même pas voir ce module.
+    if role not in {"Administrateur", "Comptable", "Auditeur"}:
+        st.warning("Accès interdit : ce module est réservé à l'administrateur principal, avec consultation seule pour le comptable et l'auditeur.")
+        return
+    can_manage = role == "Administrateur"
+    page_header("Règlement des transporteurs",
+                "Établissez la facture de transport (rapprochement coton graine) directement à partir des tickets de "
+                "pesée : quantité en tonnes, prix à la tonne, AIB, gasoil, net à payer et montant en lettres.")
+    invoices = tf.list_transport_invoices()
+    to_settle = tf.tickets_to_settle()
+    kpis([("Tickets à régler", len(to_settle)),
+          ("Factures de transport", sum(1 for i in invoices if i["status"] == "Émise")),
+          ("Reste à payer (FCFA)", money(sum(Decimal(i["net_to_pay"]) for i in invoices if i["status"] == "Émise" and not i["paid_at"])))])
+    if can_manage:
+        tabs = st.tabs(["Émettre une facture de transport", "Registre et règlement", "Transporteurs", "Référentiels AIC"])
+    else:
+        tabs = st.tabs(["Registre des factures (lecture seule)"])
+
+    if can_manage:
+        with tabs[0]:
+            transporters = tf.list_transporters()
+            if not can_manage:
+                st.info("L'émission des factures de transport est réservée à l'administrateur principal.")
+            elif not transporters:
+                st.warning("Créez d'abord la fiche du transporteur (onglet Transporteurs).")
+            else:
+                with st.container(border=True):
+                    tr = st.selectbox("Transporteur", transporters, format_func=lambda t: t["name"], key="tf_tr")
+                    avail = tf.tickets_to_settle(tr["name"])
+                    if not avail:
+                        st.info("Aucun ticket non réglé pour ce transporteur. Le nom du transporteur du ticket doit correspondre à sa fiche.")
+                    chosen = st.multiselect("Tickets à régler", avail, default=avail, key=f"tf_tickets_{tr['id']}",
+                                            format_func=lambda t: f"N° {t['ticket_no']} · {t['date_p2']} · {t['vehicle'] or '—'} · {t['net_weight']} kg")
+                    c1, c2, c3 = st.columns(3)
+                    campaign = c1.text_input("Campagne", value=(avail[0]["campaign"] if avail else "2025-2026"), key="tf_campaign")
+                    usine = c2.text_input("Usine", value="USINE DE DJOUGOU", key="tf_usine")
+                    inv_date = c3.date_input("Date de la facture", value=datetime.now().date(), key="tf_date")
+                    p1, p2, p3 = st.columns(3)
+                    price_ne = p1.number_input("Prix / tonne — Non enclavée (FCFA)", min_value=0.0, value=2500.0, step=50.0, key="tf_p_ne")
+                    price_e = p2.number_input("Prix / tonne — Enclavée (FCFA)", min_value=0.0, value=0.0, step=50.0, key="tf_p_e",
+                                              help="À renseigner si certaines lignes sont en zone enclavée.")
+                    aib = p3.number_input("Prélèvement AIB (%)", min_value=0.0, max_value=100.0, value=3.0, step=0.5, key="tf_aib",
+                                          help="3 % sur le modèle fourni. À valider selon la situation fiscale du transporteur.")
+                    g1, g2, g3 = st.columns(3)
+                    fuel_l = g1.number_input("Gasoil à déduire (litres)", min_value=0.0, value=0.0, step=1.0, key="tf_fuel_l")
+                    fuel_p = g2.number_input("Prix du litre (FCFA)", min_value=0.0, value=0.0, step=5.0, key="tf_fuel_p")
+                    objet = g3.text_input("Objet", value="FACTURE RAPPROCHEMENT COTON GRAINE", key="tf_obj")
+                    prices = {"Non Enclavée": price_ne, "Enclavée": price_e}
+                    tr_inv = ref.transporter_for_invoice(tr["id"], campaign)
+                    if tr_inv["contract_for_campaign"]:
+                        st.caption(f"Contrat n° {tr_inv['contract_no']} (campagne {campaign})")
+                    else:
+                        st.warning(f"Aucun contrat importé pour la campagne {campaign} : "
+                                   f"dernier contrat connu n° {tr_inv['contract_no'] or '—'}. Importez le fichier des contrats (onglet Référentiels AIC).")
+                    lines = tf.lines_from_tickets(chosen, prices, usine, campaign) if chosen else []
+                    undefined = [l["ticket_no"] for l in lines if l["typo"] == ref.TYPO_UNDEFINED]
+                    if undefined:
+                        st.warning("Typologie introuvable dans le fichier AIC de la campagne pour les tickets : "
+                                   + ", ".join(undefined) + ". Importez le fichier AIC ou choisissez la typologie dans le tableau.")
+                    if lines:
+                        st.caption("La typologie vient du fichier AIC de la campagne (CVPC + marché) ; vous pouvez la corriger ligne par ligne.")
+                        grid = pd.DataFrame([{"Ticket": l["ticket_no"], "Date": l["line_date"], "Véhicule": l["vehicle"],
+                                              "BE AIC": l["be_aic"], "Marché": l["market"], "Qté (T)": float(l["qty_t"]),
+                                              "Typo": l["typo"]} for l in lines])
+                        edited = st.data_editor(grid, hide_index=True, use_container_width=True,
+                                                disabled=["Ticket", "Date", "Véhicule", "BE AIC", "Marché", "Qté (T)"],
+                                                column_config={"Typo": st.column_config.SelectboxColumn("Typo", options=tf.TYPOS + [ref.TYPO_UNDEFINED], required=True)},
+                                                key="tf_grid_" + "_".join(str(l["ticket_id"]) for l in lines))
+                        for l, typo in zip(lines, edited["Typo"]):
+                            l["typo"], l["unit_price"] = typo, Decimal(str(prices.get(typo, 0)))
+                        try:
+                            calc = tf.compute_transport(lines, aib / 100, fuel_l, fuel_p)
+                            kpis([("Poids total (T)", f"{calc['total_weight_t']}"), ("Total HT (FCFA)", money(calc["total_ht"])),
+                                  (f"AIB {aib:g} % (FCFA)", money(calc["aib_amount"])), ("Net à payer (FCFA)", money(calc["net_to_pay"]))])
+                            st.caption(f"Arrêté à : {calc['amount_words']}")
+                        except Exception as exc:
+                            calc = None
+                            st.error(str(exc))
+                        if st.button("Émettre la facture de transport", type="primary", key="tf_issue", disabled=calc is None):
+                            try:
+                                res = tf.create_transport_invoice(tr_inv, lines, aib / 100, current_user["username"], campaign,
+                                                                  invoice_date=inv_date.isoformat(), objet=objet,
+                                                                  fuel_liters=fuel_l, fuel_unit_price=fuel_p)
+                                st.session_state["tf_last"] = res["id"]
+                                st.success(f"Facture {res['number']} émise — net à payer {money(res['net_to_pay'])} FCFA.")
+                            except Exception as exc:
+                                st.error(f"Émission impossible : {exc}")
+                last = st.session_state.get("tf_last")
+                if last:
+                    full = tf.get_transport_invoice(last)
+                    st.download_button(f"Télécharger {full['number']} (PDF)", data=tf.transport_pdf(full),
+                                       file_name=f"facture_transport_{full['number']}.pdf", mime="application/pdf", key="tf_dl_last")
+                limits("Les prix à la tonne et le taux d'AIB sont des paramètres saisis ici ; ils ne sont pas déduits du ticket.",
+                       "Un ticket ne peut être intégré qu'à une seule facture de transport ; l'annulation le libère.",
+                       "Quantité en tonnes = poids net ÷ 1 000, arrondie à 0,01 T.")
+
+    with (tabs[1] if can_manage else tabs[0]):
+        if not invoices:
+            st.info("Aucune facture de transport émise.")
+        else:
+            reg = pd.DataFrame(invoices)[["campaign", "number", "invoice_date", "transporter_name", "total_weight_t", "total_ht",
+                                          "aib_amount", "net_to_pay", "status", "paid_at"]]
+            reg.columns = ["Campagne", "N°", "Date", "Transporteur", "Poids (T)", "HT", "AIB", "Net à payer", "Statut", "Réglée le"]
+            show_table(reg, height=300)
+            st.download_button("Exporter le registre (Excel)", data=excel_bytes({"Factures transport": reg}),
+                               file_name=f"registre_transport_{stamp()}.xlsx", mime=XLSX)
+            sel = st.selectbox("Facture", invoices, key="tf_reg_sel",
+                               format_func=lambda i: f"{i['campaign']} · {i['number']} — {i['transporter_name']} ({i['status']})")
+            full = tf.get_transport_invoice(sel["id"])
+            st.download_button("Télécharger le PDF", data=tf.transport_pdf(full), file_name=f"facture_transport_{full['number']}.pdf",
+                               mime="application/pdf", key="tf_dl_reg")
+            if can_manage and full["status"] == "Émise":
+                if not full["paid_at"]:
+                    with st.expander("Enregistrer le règlement"):
+                        r1, r2, r3 = st.columns(3)
+                        pay_date = r1.date_input("Date de règlement", value=datetime.now().date(), key="tf_pay_date")
+                        pay_mode = r2.selectbox("Mode", ["Virement", "Espèces", "Chèque", "Mobile money"], key="tf_pay_mode")
+                        pay_ref = r3.text_input("Référence", key="tf_pay_ref")
+                        if st.button("Marquer comme réglée", key="tf_pay_btn"):
+                            try:
+                                tf.record_payment(full["id"], pay_date.isoformat(), pay_mode, pay_ref, current_user["username"])
+                                st.success("Règlement enregistré.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+                    with st.expander("Annuler cette facture"):
+                        reason = st.text_input("Motif d'annulation *", key="tf_cancel_reason")
+                        if st.button("Annuler la facture", key="tf_cancel_btn"):
+                            try:
+                                tf.cancel_transport_invoice(full["id"], reason, current_user["username"])
+                                st.success("Facture annulée ; les tickets sont à nouveau disponibles.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+                else:
+                    st.success(f"Réglée le {full['paid_at']} ({full['payment_mode']} {full['payment_ref']}).")
+
+    if can_manage:
+        with tabs[2]:
+            if not can_manage:
+                st.info("La gestion des transporteurs est réservée à l'administrateur principal.")
+            else:
+                with st.form("tf_transporter_form", clear_on_submit=True):
+                    a, b = st.columns(2)
+                    name = a.text_input("Nom & prénoms *", help="Doit correspondre au nom du transporteur sur les tickets.")
+                    phone = b.text_input("Téléphone")
+                    c, d, e = st.columns(3)
+                    ifu = c.text_input("IFU")
+                    contract = d.text_input("N° de contrat")
+                    id_piece = e.text_input("N° pièce d'identité")
+                    if st.form_submit_button("Enregistrer le transporteur", type="primary"):
+                        try:
+                            tf.save_transporter({"name": name, "phone": phone, "ifu": ifu, "contract_no": contract, "id_piece": id_piece},
+                                                current_user["username"])
+                            st.success("Fiche enregistrée.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                rows = tf.list_transporters()
+                if rows:
+                    show_table(pd.DataFrame(rows).drop(columns=["id", "created_by", "created_at"]))
+
+    if can_manage:
+        with tabs[3]:
+            if not can_manage:
+                st.info("La modification des référentiels AIC est réservée à l'administrateur principal.")
+            else:
+                st.caption("Chaque année, importez les fichiers fournis par l'AIC : l'historique des campagnes précédentes est conservé.")
+                ref_campaign = st.text_input("Campagne concernée", value="2025-2026", key="ref_campaign")
+
+                st.subheader("1. Typologie, CVPC et marché (fichier AIC)")
+                st.download_button("Télécharger le modèle", data=ref.market_template_bytes(), file_name="modele_marches_aic.xlsx",
+                                   mime=XLSX, key="ref_mk_tpl")
+                up_mk = st.file_uploader("Fichier AIC (.xlsx, .xlsm, .csv)", type=ACCEPTED, key="ref_mk_upload")
+                if up_mk is not None:
+                    try:
+                        raw_mk, _ = read_table(up_mk, "ref_mk", "Feuille du fichier AIC")
+                        parsed = ref.parse_markets(raw_mk)
+                        kpis([("Lignes valides", len(parsed["rows"])), ("Lignes rejetées", len(parsed["rejected"]))])
+                        if parsed["ignored_columns"]:
+                            st.caption("Colonnes non utilisées : " + ", ".join(parsed["ignored_columns"]))
+                        if parsed["rejected"]:
+                            show_table(pd.DataFrame(parsed["rejected"]))
+                        if parsed["rows"]:
+                            show_table(pd.DataFrame(parsed["rows"]).head(50))
+                            replace = st.checkbox("Remplacer tout le référentiel de cette campagne (sinon : mise à jour des lignes)",
+                                                  key="ref_mk_replace")
+                            if st.button("Importer le fichier AIC", type="primary", key="ref_mk_go"):
+                                res = ref.save_markets(parsed["rows"], ref_campaign, current_user["username"], replace=replace,
+                                                       source_file=up_mk.name)
+                                st.success(f"{res['imported']} lignes importées — {res['total_campaign']} marchés pour la campagne {ref_campaign}.")
+                    except Exception as exc:
+                        st.error(f"Import impossible : {exc}")
+                current_mk = ref.list_markets(ref_campaign)
+                with st.expander(f"Marchés enregistrés pour {ref_campaign} ({len(current_mk)})"):
+                    show_table(pd.DataFrame(current_mk), height=300)
+
+                st.subheader("2. Transporteurs et numéros de contrat")
+                st.download_button("Télécharger le modèle", data=ref.transporter_template_bytes(), file_name="modele_transporteurs_contrats.xlsx",
+                                   mime=XLSX, key="ref_tr_tpl")
+                up_tr = st.file_uploader("Fichier des transporteurs et contrats (.xlsx, .xlsm, .csv)", type=ACCEPTED, key="ref_tr_upload")
+                if up_tr is not None:
+                    try:
+                        raw_tr, _ = read_table(up_tr, "ref_tr", "Feuille des transporteurs")
+                        parsed_tr = ref.parse_transporters(raw_tr)
+                        kpis([("Lignes valides", len(parsed_tr["rows"])), ("Lignes rejetées", len(parsed_tr["rejected"]))])
+                        if parsed_tr["rejected"]:
+                            show_table(pd.DataFrame(parsed_tr["rejected"]))
+                        if parsed_tr["rows"]:
+                            show_table(pd.DataFrame(parsed_tr["rows"]).head(50))
+                            if st.button("Importer les transporteurs et contrats", type="primary", key="ref_tr_go"):
+                                res = ref.save_transporters(parsed_tr["rows"], ref_campaign, current_user["username"], source_file=up_tr.name)
+                                st.success(f"{res['imported']} contrats importés pour {ref_campaign} dont {res['created']} nouveaux transporteurs.")
+                    except Exception as exc:
+                        st.error(f"Import impossible : {exc}")
+                current_ct = ref.list_contracts(ref_campaign)
+                with st.expander(f"Contrats enregistrés pour {ref_campaign} ({len(current_ct)})"):
+                    show_table(pd.DataFrame(current_ct), height=300)
+
+                st.subheader("3. Noms de transporteurs non reconnus sur les tickets")
+                unmatched = ref.unmatched_ticket_transporters()
+                fiches = tf.list_transporters()
+                if not unmatched:
+                    st.caption("Tous les noms de transporteurs des tickets correspondent à une fiche.")
+                elif not fiches:
+                    st.info("Importez d'abord les transporteurs.")
+                else:
+                    st.caption("Rattachez chaque nom du ticket à la bonne fiche : la correspondance est mémorisée pour les prochains tickets.")
+                    for i, u in enumerate(unmatched):
+                        c1, c2, c3 = st.columns([3, 3, 1])
+                        c1.markdown(f"**{md_escape(u['name'])}** — {u['tickets']} ticket(s)")
+                        default = next((k for k, f in enumerate(fiches) if ref.norm(f["name"]) == u["suggestion_norm"]), 0)
+                        target = c2.selectbox("Fiche", fiches, index=default, format_func=lambda f: f["name"],
+                                              key=f"ref_alias_sel_{i}", label_visibility="collapsed")
+                        if c3.button("Rattacher", key=f"ref_alias_btn_{i}"):
+                            ref.link_alias(u["name"], target["id"], current_user["username"])
+                            st.rerun()
+
+
+# --------------------------------------------------------------------------
 # Navigation par rôle
 # --------------------------------------------------------------------------
 PAGES = [
@@ -839,6 +1314,12 @@ PAGES = [
      {"Administrateur", "Comptable", "Responsable", "Auditeur"}),
     ("Contrôles", "Factures et TVA", ":material/receipt_long:", "factures", page_factures,
      {"Administrateur", "Comptable"}),
+    ("Transport", "Tickets de pesée", ":material/scale:", "tickets-pesee", page_tickets_pesee,
+     {"Administrateur", "Comptable", "Responsable", "Auditeur"}),
+    ("Transport", "Factures de transport", ":material/local_shipping:", "reglement-transporteurs", page_reglement_transporteurs,
+     {"Administrateur", "Comptable", "Auditeur"}),
+    ("Stocks", "Gestion des stocks", ":material/warehouse:", "gestion-stocks", page_gestion_stocks,
+     {"Administrateur", "Comptable", "Responsable", "Auditeur", "Magasinier"}),
     ("Stocks", "Stocks physiques", ":material/inventory_2:", "stocks", page_stocks,
      {"Administrateur", "Comptable", "Responsable", "Auditeur"}),
     ("Stocks", "Campagnes d'inventaire", ":material/assignment:", "campagnes", page_campagnes,

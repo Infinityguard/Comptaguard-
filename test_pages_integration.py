@@ -46,7 +46,7 @@ class Session(dict):
 def fake_streamlit(uploads=None, clicks=(), submits=(), radio=None, numbers=None):
     st = MagicMock(name="streamlit")
     st.session_state = Session()
-    st.errors, st.metrics, st.pages = [], [], []
+    st.errors, st.metrics, st.pages, st.warnings, st.infos = [], [], [], [], []
 
     class Col:                                   # une colonne délègue à st
         def __getattr__(self, name):
@@ -75,6 +75,8 @@ def fake_streamlit(uploads=None, clicks=(), submits=(), radio=None, numbers=None
     st.stop.side_effect = SystemExit
     st.rerun.side_effect = Rerun()
     st.error.side_effect = lambda m, *a, **k: st.errors.append(str(m))
+    st.warning.side_effect = lambda m, *a, **k: st.warnings.append(str(m))
+    st.info.side_effect = lambda m, *a, **k: st.infos.append(str(m))
     st.metric.side_effect = lambda label, value, **k: st.metrics.append((label, value))
     st.Page.side_effect = lambda func, title=None, icon=None, url_path=None: (
         st.pages.append(title) or types.SimpleNamespace(title=title, url_path=url_path))
@@ -90,8 +92,11 @@ def load_app(tmp_path, monkeypatch, role="Administrateur", **options):
         security_db.create_user("admin", "Admin Test", "Administrateur", "motdepasse-solide-123", "t")
         security_db.create_user("mag", "Magasin Test", "Magasinier", "motdepasse-solide-123", "t")
         security_db.create_user("paie", "Paie Test", "Gestionnaire de paie", "motdepasse-solide-123", "t")
+        security_db.create_user("comp", "Comptable Test", "Comptable", "motdepasse-solide-123", "t")
+        security_db.create_user("audit", "Auditeur Test", "Auditeur", "motdepasse-solide-123", "t")
     st = fake_streamlit(**options)
-    user_id = {"Administrateur": 1, "Magasinier": 2, "Gestionnaire de paie": 3}[role]
+    user_id = {"Administrateur": 1, "Magasinier": 2, "Gestionnaire de paie": 3,
+               "Comptable": 4, "Auditeur": 5}[role]
     st.session_state.auth_user = {"id": user_id, "username": "x"}
     for name in ("app", "ui", "streamlit"):
         sys.modules.pop(name, None)
@@ -195,11 +200,16 @@ def test_navigation_selon_le_role(tmp_path, monkeypatch):
         st.pages.clear()
         app.build_navigation(role)
         return set(st.pages)
-    assert titles("Magasinier") == {"Comptage d'inventaire"}
+    assert titles("Magasinier") == {"Comptage d'inventaire", "Gestion des stocks"}
     paie = titles("Gestionnaire de paie")
     assert paie == {"Paie"}                       # pas d'accès au rapprochement ni aux écritures
     assert "Administration" in titles("Administrateur") and "Administration" not in titles("Comptable")
     assert "Rapprochement" in titles("Auditeur")
+    assert "Factures de transport" in titles("Administrateur")
+    assert "Factures de transport" in titles("Comptable")
+    assert "Factures de transport" in titles("Auditeur")
+    assert "Factures de transport" not in titles("Magasinier")
+    assert "Factures de transport" not in titles("Responsable")
 
 
 def test_session_expiree_apres_inactivite(tmp_path, monkeypatch):
@@ -240,3 +250,17 @@ def test_blocage_de_connexion_affiche_un_message(tmp_path, monkeypatch):
             sys.modules.pop(n, None)
             if mod is not None:
                 sys.modules[n] = mod
+
+
+def test_factures_transport_interdites_au_magasinier(tmp_path, monkeypatch):
+    _, st = run_pages(tmp_path, monkeypatch, ["page_reglement_transporteurs"], role="Magasinier", user="mag")
+    assert any("Accès interdit" in msg for msg in st.warnings)
+    assert not any("Factures de transport" in msg for msg in st.metrics)
+
+
+def test_factures_transport_lecture_seule_comptable_auditeur(tmp_path, monkeypatch):
+    for role, user in (("Comptable", "comp"), ("Auditeur", "audit")):
+        _, st = run_pages(tmp_path, monkeypatch, ["page_reglement_transporteurs"], role=role, user=user)
+        assert st.errors == []
+        tab_labels = st.tabs.call_args.args[0]
+        assert tab_labels == ["Registre des factures (lecture seule)"]
